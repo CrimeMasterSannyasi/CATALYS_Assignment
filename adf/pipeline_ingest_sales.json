@@ -1,0 +1,217 @@
+{
+  "name": "pipeline_ingest_sales",
+  "properties": {
+    "description": "Ingest sales CSV files from source to Bronze layer with incremental loading",
+    "activities": [
+      {
+        "name": "Get_Watermark",
+        "type": "Lookup",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 3,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "AzureSqlSource",
+            "sqlReaderQuery": "SELECT watermark_value FROM audit.watermark WHERE source_table = 'sales_orders'"
+          },
+          "dataset": {
+            "referenceName": "ds_sql_audit",
+            "type": "DatasetReference"
+          }
+        }
+      },
+      {
+        "name": "Copy_Sales_to_Raw",
+        "type": "Copy",
+        "dependsOn": [
+          {
+            "activity": "Get_Watermark",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "DelimitedTextSource",
+            "additionalColumns": [
+              {
+                "name": "ingestion_timestamp",
+                "value": "$$COLUMN:current_timestamp"
+              },
+              {
+                "name": "source_filename",
+                "value": "$$FILEPATH"
+              }
+            ],
+            "storeSettings": {
+              "type": "FileServerReadSettings",
+              "recursive": true,
+              "wildcardFileName": "sales_*.csv",
+              "enablePartitionDiscovery": false
+            },
+            "formatSettings": {
+              "type": "DelimitedTextReadSettings",
+              "skipLineCount": 0
+            }
+          },
+          "sink": {
+            "type": "ParquetSink",
+            "storeSettings": {
+              "type": "AzureBlobFSWriteSettings",
+              "copyBehavior": "PreserveHierarchy"
+            },
+            "formatSettings": {
+              "type": "ParquetWriteSettings"
+            }
+          },
+          "enableStaging": false,
+          "dataIntegrationUnits": 4,
+          "translator": {
+            "type": "TabularTranslator",
+            "mappings": [
+              {"source": {"name": "order_id"}, "sink": {"name": "order_id"}},
+              {"source": {"name": "customer_id"}, "sink": {"name": "customer_id"}},
+              {"source": {"name": "product_id"}, "sink": {"name": "product_id"}},
+              {"source": {"name": "order_date"}, "sink": {"name": "order_date"}},
+              {"source": {"name": "order_timestamp"}, "sink": {"name": "order_timestamp"}},
+              {"source": {"name": "quantity"}, "sink": {"name": "quantity"}},
+              {"source": {"name": "unit_price"}, "sink": {"name": "unit_price"}},
+              {"source": {"name": "discount_amount"}, "sink": {"name": "discount_amount"}},
+              {"source": {"name": "shipping_cost"}, "sink": {"name": "shipping_cost"}},
+              {"source": {"name": "line_total"}, "sink": {"name": "line_total"}},
+              {"source": {"name": "status"}, "sink": {"name": "status"}},
+              {"source": {"name": "payment_method"}, "sink": {"name": "payment_method"}},
+              {"source": {"name": "last_modified"}, "sink": {"name": "last_modified"}}
+            ]
+          }
+        },
+        "inputs": [
+          {
+            "referenceName": "ds_source_sales_csv",
+            "type": "DatasetReference"
+          }
+        ],
+        "outputs": [
+          {
+            "referenceName": "ds_datalake_bronze_sales",
+            "type": "DatasetReference",
+            "parameters": {
+              "folder_date": "@formatDateTime(utcnow(), 'yyyy/MM/dd')"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Copy_to_Bronze",
+        "type": "Copy",
+        "dependsOn": [
+          {
+            "activity": "Copy_Sales_to_Raw",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0
+        },
+        "typeProperties": {
+          "source": {
+            "type": "ParquetSource",
+            "storeSettings": {
+              "type": "AzureBlobFSReadSettings",
+              "recursive": true
+            }
+          },
+          "sink": {
+            "type": "ParquetSink",
+            "storeSettings": {
+              "type": "AzureBlobFSWriteSettings"
+            }
+          },
+          "enableStaging": false
+        },
+        "inputs": [
+          {
+            "referenceName": "ds_datalake_raw_sales",
+            "type": "DatasetReference"
+          }
+        ],
+        "outputs": [
+          {
+            "referenceName": "ds_datalake_bronze_sales",
+            "type": "DatasetReference"
+          }
+        ]
+      },
+      {
+        "name": "Log_Pipeline_Start",
+        "type": "SqlServerStoredProcedure",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0
+        },
+        "typeProperties": {
+          "storedProcedureName": "audit.sp_log_pipeline_run",
+          "storedProcedureParameters": {
+            "pipeline_name": {"value": "@pipeline().Pipeline", "type": "String"},
+            "status": {"value": "START", "type": "String"},
+            "batch_id": {"value": "@pipeline().RunId", "type": "String"}
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_azuresql_analytics",
+          "type": "LinkedServiceReference"
+        }
+      },
+      {
+        "name": "Log_Pipeline_Success",
+        "type": "SqlServerStoredProcedure",
+        "dependsOn": [
+          {
+            "activity": "Copy_to_Bronze",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0
+        },
+        "typeProperties": {
+          "storedProcedureName": "audit.sp_log_pipeline_run",
+          "storedProcedureParameters": {
+            "pipeline_name": {"value": "@pipeline().Pipeline", "type": "String"},
+            "status": {"value": "SUCCESS", "type": "String"},
+            "records_read": {"value": "@activity('Copy_Sales_to_Raw').output.rowsRead", "type": "Int"},
+            "records_written": {"value": "@activity('Copy_to_Bronze').output.rowsCopied", "type": "Int"},
+            "batch_id": {"value": "@pipeline().RunId", "type": "String"}
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "ls_azuresql_analytics",
+          "type": "LinkedServiceReference"
+        }
+      }
+    ],
+    "parameters": {
+      "source_folder": {
+        "type": "string",
+        "defaultValue": "/source/sales"
+      }
+    },
+    "annotations": [
+      "Sales Ingestion",
+      "Daily Batch"
+    ],
+    "folder": {
+      "name": "Sales_Pipeline"
+    }
+  }
+}
